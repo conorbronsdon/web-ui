@@ -1,0 +1,7 @@
+# docker/entrypoint.sh is executed as `sh /usr/src/app/docker/entrypoint.sh`
+# inside a Linux container after being bind-mounted straight from a checkout
+# on the host. If it's checked out with CRLF line endings (the default for
+# many Windows git installs with core.autocrlf=true), the embedded \r
+# characters break the shebang / break `sh` parsing entirely. Force LF for
+# shell scripts regardless of the host platform's autocrlf setting.
+*.sh text eol=lf

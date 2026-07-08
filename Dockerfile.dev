@@ -1,0 +1,50 @@
+# syntax=docker/dockerfile:1
+#
+# Development image for web-ui (issue #516: a plain-Docker dev environment,
+# no VS Code / Codespaces required).
+#
+# Pinned to the exact patch version in .nvmrc (v16.20.2) rather than the
+# floating `node:16-bullseye` tag, since that tag is confirmed to exist on
+# Docker Hub. Matching .nvmrc exactly means no `NODE_OPTIONS=--openssl-legacy-provider`
+# workaround is needed -- that flag is only required on Node >=17, and is
+# actively rejected (`--openssl-legacy-provider is not allowed in NODE_OPTIONS`)
+# on Node 16. See the node:20/22/24/25 attempts and the openssl workaround
+# discussion earlier in issue #516.
+FROM node:16.20.2-bullseye
+
+WORKDIR /usr/src/app
+
+# The plain node image runs as root by default (unlike
+# mcr.microsoft.com/devcontainers/javascript-node, whose default user is the
+# unprivileged "node" account -- that's why .devcontainer/devcontainer.json's
+# postCreateCommand needs `sudo corepack enable`). No sudo dance needed here.
+#
+# package.json already pins "packageManager": "yarn@3.4.1", which is what
+# lets corepack auto-select the right yarn on first invocation -- but we
+# still call `corepack prepare --activate` explicitly at build time so the
+# yarn binary is ready immediately and the image doesn't need network access
+# on first container start just to resolve/download yarn.
+RUN corepack enable && corepack prepare yarn@3.4.1 --activate
+
+# Intentionally no COPY and no `yarn install` here.
+#
+# The repo is bind-mounted into the container at runtime (see
+# docker-compose.dev.yml), so anything copied into the image at build time
+# would just be shadowed by the mount -- copying source here would be dead
+# weight in the image with no effect on the running container. Dependency
+# installation happens once at container start (see docker/entrypoint.sh),
+# writing into a *named volume* mounted at /usr/src/app/node_modules rather
+# than the bind-mounted repo directory. That's the standard
+# bind-mount-repo + volume-for-node_modules pattern:
+#   - native modules (this repo pulls in `sharp`, which compiles from source)
+#     get built for the container's Linux/glibc target, and that build isn't
+#     clobbered by whatever the host's ./node_modules looks like (or doesn't
+#     look like, on a Windows host where node_modules may not exist / may be
+#     built for a different OS+arch entirely).
+#   - editing files in the bind-mounted source on the host doesn't require an
+#     image rebuild -- only changing dependencies does (and even then, only
+#     a container restart, not a rebuild, since install runs at start).
+#
+# This keeps the image itself minimal and rebuild-free across day-to-day
+# development; see docs/docker-dev.md for the full compose-level flow.
+CMD ["bash"]
