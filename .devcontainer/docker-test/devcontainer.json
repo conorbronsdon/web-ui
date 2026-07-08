@@ -1,0 +1,11 @@
+{
+  "name": "docker-in-docker-test-THROWAWAY",
+  "image": "mcr.microsoft.com/devcontainers/universal:2",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "version": "latest"
+    }
+  },
+  "forwardPorts": [9001, 5001],
+  "remoteUser": "codespace"
+}
