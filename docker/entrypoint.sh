@@ -1,5 +1,5 @@
 #!/bin/sh
-# Shared entrypoint for both services in docker-compose.dev.yml.
+# Entrypoint for the web-ui-dev service in docker-compose.dev.yml.
 #
 # Seeds the .env files the dev server and API server need, using the exact
 # same guard logic as .devcontainer/devcontainer.json's postCreateCommand:

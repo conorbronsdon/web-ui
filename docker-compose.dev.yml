@@ -1,88 +1,42 @@
 # Plain-Docker dev environment for web-ui (issue #516).
 #
-# Two services, one shared node_modules volume:
+# One service, one container, running BOTH the webpack dev server and the
+# Express API server.
 #
-#   web-ui-dev      Runs `yarn install` then the webpack dev server via
-#                   `yarn run dev:docker` (Marzal's #524 script -- REQUIRED
-#                   here, not just `yarn run dev`, because that script binds
-#                   webpack-dev-server to 0.0.0.0. Docker's port publishing
-#                   forwards *into* the container's own loopback interface;
-#                   a server bound only to 127.0.0.1 inside the container is
-#                   unreachable from the host no matter how the port is
-#                   published). Serves the UI on :9001.
+# Why one container and not two: webpack.config.js's devServer proxies the
+# browser-facing routes -- `/`, `/api`, `/namespace`, `/podcast` -- to
+# `http://localhost:5001` (the Express API server). That target is hardcoded
+# to `localhost`. If the dev server and the API server run in two separate
+# containers, they sit in two separate network namespaces, so `localhost:5001`
+# inside the dev-server container reaches nothing -- the page (`/`) and every
+# `/api/*` call fail through the proxy with a 502/504. Running both processes
+# in a single container keeps them on one shared loopback, so the proxy target
+# resolves. This is the same shape as the merged #586 devcontainer, which also
+# runs both processes on one localhost.
 #
-#   web-ui-api-dev  Runs `yarn run start` (`node server`), the Express API
-#                   / reverse-proxy server, on :5001.
-#
-# Why a second service instead of `docker compose exec web-ui-dev yarn run
-# start`: the README's own "Starting the dev server" section already runs
-# these as two separate, independent, long-running processes in two
-# terminal windows. A second compose service is the container-native
-# version of that same shape -- `docker compose up` starts both, `docker
-# compose logs -f web-ui-api-dev` follows just the API server, one process
-# crashing/restarting doesn't take the other down with it, and a fresh
-# clone doesn't require anyone to remember an extra manual `exec` step after
-# `up` finishes. `exec` also has a hard precondition this repo can't
-# guarantee: it only works if web-ui-dev's foreground process is a shell (or
-# something you can attach a second command to), not a long-running
-# webpack-dev-server process filling the container's PID 1.
-#
-# Why web-ui-api-dev depends on web-ui-dev's *healthcheck* rather than each
-# service just running its own `yarn install`: both services share the same
-# node_modules named volume. Two `yarn install` invocations starting at the
-# same time against that shared volume is a real race (concurrent writes
-# into node_modules, including the `sharp` native build) -- not merely
-# "wasteful". Rather than inventing a separate one-shot installer service,
-# web-ui-api-dev waits on web-ui-dev's healthcheck (see
-# docker/healthcheck-dev.js), which only reports healthy once the dev
-# server is answering on :9001 -- which implies `yarn install` already
-# completed. web-ui-api-dev's own command then skips `yarn install` entirely
-# and runs directly against the now-populated volume.
+# The API server is started in the background and the webpack dev server in the
+# foreground (PID 1). `yarn install` runs once, before either server starts, so
+# there is no concurrent write into the shared node_modules volume.
 services:
   web-ui-dev:
     build:
       context: .
       dockerfile: Dockerfile.dev
     entrypoint: ["sh", "/usr/src/app/docker/entrypoint.sh"]
-    command: ["sh", "-c", "yarn install && yarn run dev:docker"]
+    command: ["sh", "-c", "yarn install && { yarn run start & } && yarn run dev:docker"]
     working_dir: /usr/src/app
     volumes:
       - .:/usr/src/app
       - web-ui-node-modules:/usr/src/app/node_modules
     ports:
+      # 9001 = webpack dev server (UI, the address you actually open).
+      # 5001 = Express API server. Published for parity with the README /
+      # issue #516 ask and so the API can be hit directly; the UI itself
+      # reaches it internally over localhost:5001 via the dev-server proxy.
       - "9001:9001"
-    environment:
-      COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
-    healthcheck:
-      test: ["CMD", "node", "/usr/src/app/docker/healthcheck-dev.js"]
-      interval: 10s
-      timeout: 5s
-      # retries is generous on purpose: first-time `yarn install` in a cold
-      # container (no persisted yarn cache volume) has to compile `sharp`
-      # from source, which the merged devcontainer's Codespace run also hit
-      # (see #516/#586 discussion) -- that plus webpack's own first compile
-      # can take several minutes. start_period keeps early failures from
-      # counting against retries at all while that install is in progress.
-      retries: 60
-      start_period: 60s
-
-  web-ui-api-dev:
-    build:
-      context: .
-      dockerfile: Dockerfile.dev
-    entrypoint: ["sh", "/usr/src/app/docker/entrypoint.sh"]
-    command: ["yarn", "run", "start"]
-    working_dir: /usr/src/app
-    volumes:
-      - .:/usr/src/app
-      - web-ui-node-modules:/usr/src/app/node_modules
-    ports:
       - "5001:5001"
     environment:
       COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
-    depends_on:
-      web-ui-dev:
-        condition: service_healthy
 
 volumes:
   web-ui-node-modules:

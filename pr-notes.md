@@ -27,11 +27,16 @@ left open:
 1. **Node tag precision** — `node:16.20.2-bullseye` (confirmed to exist on
    Docker Hub) instead of the floating `node:16-bullseye`, so the pin can't
    silently drift to a different 16.x patch later.
-2. **How `yarn start` (the API server) runs** — as a second Compose
-   service (`web-ui-api-dev`) rather than `docker compose exec`, gated on a
-   healthcheck so it doesn't race `web-ui-dev`'s `yarn install` against the
-   same shared `node_modules` volume. Full reasoning in
-   `docs/docker-dev.md`.
+2. **How `yarn start` (the API server) runs** — in the *same* container as
+   the dev server (API backgrounded, dev server foreground), not as a second
+   Compose service. This is forced by `webpack.config.js`: its `devServer`
+   proxies `/`, `/api`, `/namespace`, `/podcast` to a hardcoded
+   `http://localhost:5001`, so the API server has to be reachable at
+   `localhost:5001` from the dev server — which only holds if they share one
+   loopback, i.e. one container. Two containers = two network namespaces =
+   the proxy target resolves to nothing (page + API calls 502/504). The
+   merged #586 devcontainer runs both in one container for the same reason.
+   Full reasoning in `docs/docker-dev.md`.
 
 Docs live at `docs/docker-dev.md` rather than in the README, because #587
 (README documentation for the Codespaces/devcontainer setup) is still open
@@ -42,14 +47,15 @@ the two together once #587 merges.
 ## Files changed
 
 ```
- .gitattributes            |   7 +++
- Dockerfile.dev            |  50 +++++++++++++++
- docker-compose.dev.yml    |  88 ++++++++++++++++++++++++++
- docker/entrypoint.sh      |  32 ++++++++++
- docker/healthcheck-dev.js |  27 ++++++++
- docs/docker-dev.md        | 155 ++++++++++++++++++++++++++++++++++++++++++++++
- 6 files changed, 359 insertions(+)
+ .gitattributes         |  7 +++
+ Dockerfile.dev         | 50 +++++++++++++++
+ docker-compose.dev.yml | 45 ++++++++++++
+ docker/entrypoint.sh   | 32 ++++++++++
+ docs/docker-dev.md     | ~150 +++++++++++++++++++++++++++++++++++++++++
+ 5 files changed
 ```
+(Run `git diff --stat` to get exact line counts before opening — figures
+above are approximate after the single-container revision.)
 
 (`.gitattributes` is new to the repo — added to force LF line endings on
 `*.sh` files. `docker/entrypoint.sh` is bind-mounted straight from a
@@ -76,14 +82,15 @@ during this work.)
 >   volume, so a host `node_modules` (if one exists, and if it's even built
 >   for the right OS/arch) never collides with the container's build —
 >   including `sharp`, which compiles from source.
-> - `docker-compose.dev.yml`: two services sharing that bind mount + volume
->   — `web-ui-dev` (`yarn install && yarn run dev:docker`, port 9001,
->   using @Marzal's `#524` script so the dev server is actually reachable
->   from the host) and `web-ui-api-dev` (`yarn run start`, port 5001,
->   gated on `web-ui-dev`'s healthcheck rather than running its own
->   `yarn install` concurrently against the same volume). Reasoning for
->   both the two-service split and the healthcheck gating is in
->   `docs/docker-dev.md`.
+> - `docker-compose.dev.yml`: one service over that bind mount + volume,
+>   running both servers in one container — `yarn install` once, then
+>   `yarn run start` (Express API, port 5001) in the background and
+>   `yarn run dev:docker` (webpack dev server, port 9001, @Marzal's `#524`
+>   script so it binds `0.0.0.0` and is reachable from the host) in the
+>   foreground. One container because `webpack.config.js` proxies the dev
+>   server's routes to a hardcoded `http://localhost:5001`, so the API has
+>   to live on the same loopback; splitting into two containers breaks that
+>   proxy. Reasoning in `docs/docker-dev.md`.
 > - `docker/entrypoint.sh`: seeds `.env` and
 >   `.environments/.env.development` from `.env-example` if missing —
 >   exactly the same guard as `.devcontainer/devcontainer.json`'s
@@ -116,14 +123,25 @@ on (confirmed before starting). What was and wasn't checked:
 **Checked:**
 - `docker-compose.dev.yml` parses as valid YAML (`python -c "import yaml;
   yaml.safe_load(open('docker-compose.dev.yml'))"` — succeeds, and the
-  parsed structure matches what was intended: two services, correct
-  `depends_on`/`condition`/`healthcheck` shape, one top-level volume).
+  parsed structure matches what was intended: one service publishing 9001
+  and 5001, one top-level `node_modules` volume, the bind mount, and the
+  single-container `yarn install && { yarn run start & } && yarn run
+  dev:docker` command).
 - `docker/entrypoint.sh` passes `bash -n` (syntax only — cannot execute it
   without a container, so the actual `.env` guard behavior at runtime is
   unverified beyond code inspection).
-- `docker/healthcheck-dev.js` passes `node --check` (syntax only, same
-  caveat — the actual HTTP probe against a running dev server is
-  unverified).
+- The container command string
+  (`yarn install && { yarn run start & } && yarn run dev:docker`) passes
+  `sh -n` (syntax only).
+- Traced the dev-server proxy: `webpack.config.js` proxies `/`, `/api`,
+  `/namespace`, `/podcast` to a hardcoded `http://localhost:5001`, and
+  `server/www` has no `index.html` (so `/` is proxied, not served locally).
+  This is why the API server must share the dev server's loopback — the
+  reason for the single-container design. (An earlier two-service draft with
+  a healthcheck-gated `web-ui-api-dev` was found broken in adversarial review
+  for exactly this reason — the cross-container proxy target and a circular
+  healthcheck deadlock — and collapsed to one container before this was
+  opened.)
 - `Dockerfile.dev` reviewed by eye against common Hadolint rules: explicit
   version pin (not `latest`), exec-form `CMD`, no `ADD`, no unnecessary
   layers, no unpinned `apt-get` (none used at all). One thing Hadolint
@@ -155,9 +173,11 @@ on (confirmed before starting). What was and wasn't checked:
   that's a different execution environment (Codespaces' underlying
   container host) than a local Docker Engine, so it's supporting evidence,
   not proof, for this Dockerfile.
-- Whether the `web-ui-dev` healthcheck actually flips to healthy in
-  practice, and therefore whether `web-ui-api-dev`'s `depends_on` gate
-  behaves as designed rather than hanging.
+- Whether the backgrounded API server (`yarn run start &`) and the
+  foreground dev server actually come up cleanly in one container, and
+  whether the dev server's proxy reaches the API over `localhost:5001`
+  in practice (reasoned to be correct now that both share a loopback, but
+  not run).
 - Whether port publishing on the target host (particularly Windows/Docker
   Desktop, since that's the authoring environment) behaves as expected for
   both 9001 and 5001 simultaneously.

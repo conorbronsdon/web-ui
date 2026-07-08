@@ -19,8 +19,8 @@ conflicts against #587's edits to the same file.
 ## Prerequisites
 
 - Docker Engine or Docker Desktop with Compose v2 (the `docker compose`
-  subcommand, not the standalone `docker-compose` v1 binary -- this file
-  uses `depends_on: condition: service_healthy`, which needs Compose v2).
+  subcommand). The quick-start command below uses the `docker compose`
+  spelling throughout.
 
 ## Quick start
 
@@ -57,46 +57,37 @@ docker compose -f docker-compose.dev.yml down -v
 | File | Purpose |
 |---|---|
 | `Dockerfile.dev` | Node 16.20.2 (exact `.nvmrc` match) + yarn 3.4.1 via Corepack. No source is copied in and no install happens at build time -- see the comments in the file for why. |
-| `docker-compose.dev.yml` | Two services, `web-ui-dev` (UI, :9001) and `web-ui-api-dev` (API, :5001), sharing the bind-mounted repo and a named `node_modules` volume. |
+| `docker-compose.dev.yml` | One service, `web-ui-dev`, running both the webpack dev server (UI, :9001) and the Express API server (:5001) in a single container, over the bind-mounted repo and a named `node_modules` volume. |
 | `docker/entrypoint.sh` | Seeds `.env` and `.environments/.env.development` from `.env-example` if they don't already exist -- exact same guard logic as `.devcontainer/devcontainer.json`'s `postCreateCommand`, just as a script instead of an inline `&&` chain. |
-| `docker/healthcheck-dev.js` | Lets `web-ui-api-dev` wait for `web-ui-dev` to finish installing and come up, instead of racing it to run `yarn install` against the same shared volume. |
 
 ## Design notes / choices made
 
-**Why two services instead of one + `docker compose exec`.** The README's
-own "Starting the dev server" instructions already run the dev server and
-the API server as two independent long-running processes in two terminal
-windows. Two Compose services is the direct translation of that: `docker
-compose up` starts both, logs are separable
-(`docker compose logs -f web-ui-api-dev`), and one crashing/restarting
-doesn't take the other down. `docker compose exec` was the other option in
-the original ask, but it has a real precondition problem here: `exec` runs
-a second process *inside an already-running container*, which only works
-smoothly if that container's foreground process is something you can
-attach a second command alongside (e.g. a shell). `web-ui-dev`'s foreground
-process is `yarn run dev:docker` (webpack-dev-server), which owns PID 1 --
-there's no natural place to `exec` a second long-running server into that
-same container without it competing for the terminal/lifecycle with the
-dev server. A second service avoids the question entirely.
+**Why one container running both processes, not two services.** The obvious
+translation of the README's "run the dev server and the API server in two
+terminal windows" would be two Compose services. That doesn't work here, and
+the reason is the dev-server proxy. `webpack.config.js`'s `devServer.proxy`
+sends the browser-facing routes (`/`, `/api`, `/namespace`, `/podcast`) to a
+hardcoded `http://localhost:5001` -- the Express API server. Two services means
+two containers means two network namespaces, so `localhost:5001` inside the
+dev-server container resolves to nothing: the initial page load (`/`) and every
+`/api/*` call fail through the proxy with a 502/504. (The already-merged #586
+devcontainer sidesteps this the same way -- it runs both processes inside one
+container, on one shared loopback.) So this runs both in a single container:
+`yarn install` once, then `yarn run start` (API) in the background and
+`yarn run dev:docker` (dev server) in the foreground. Because they share one
+loopback, the proxy's `localhost:5001` target resolves. A single `yarn install`
+also means there's no second process writing into the shared `node_modules`
+volume concurrently, so no install race to guard against. The tradeoff: the two
+servers' logs interleave in one stream, and if the backgrounded API crashes the
+container keeps running on the foreground dev server -- both acceptable for a
+dev environment.
 
-**Why `web-ui-api-dev` doesn't just run its own `yarn install`.** Both
-services mount the *same* named volume at `/usr/src/app/node_modules` (so
-neither has to reinstall what the other already has, and both see one
-consistent `sharp` native build). If both services' commands started with
-`yarn install` and both containers came up at the same time via
-`docker compose up`, you'd have two `yarn install` processes writing into
-the same volume concurrently -- a real race, not just wasted work,
-especially for a native module build like `sharp`. Instead, `web-ui-dev` is
-the one that runs `yarn install` (matching the original ask: "command runs
-`yarn install` then `yarn run dev:docker`"), and `web-ui-api-dev` has
-`depends_on: web-ui-dev: condition: service_healthy` -- it only starts
-`yarn run start` once `web-ui-dev`'s healthcheck confirms the dev server is
-answering on :9001, which can only be true once `yarn install` already
-finished. A third, one-shot "installer-only" service was the other option
-considered; the healthcheck-gated approach was picked to keep the compose
-file to two services instead of three, at the cost of `web-ui-api-dev`
-being unable to start until `web-ui-dev` is fully up (acceptable for a dev
-environment).
+If you specifically want two separate services/containers, the only way to keep
+the hardcoded `localhost:5001` proxy target reachable is to have the API
+container share the dev-server container's network namespace
+(`network_mode: "service:web-ui-dev"`, with all ports published on
+`web-ui-dev`). That's more moving parts for no dev-time benefit over the
+single-container form above, so it isn't what ships here.
 
 **Why the entrypoint doesn't seed `.environments/.env.production`.** The
 README documents three env files as necessary in principle (`.env`,
@@ -130,12 +121,20 @@ that entirely -- it works whether or not the bit survived.
   slow but was proven to complete cleanly on this same Node 16 base by the
   merged devcontainer's Codespace run (#586) -- not independently verified
   in a real Docker Engine container from this machine (see `pr-notes.md`).
-- **Loopback vs `0.0.0.0`.** Plain `docker run -p`/Compose `ports:`
-  publishing forwards into the container's own network namespace; a server
-  bound to `127.0.0.1` *inside* the container is unreachable from the host
-  regardless of how the port is published. `yarn run dev` alone hits this.
-  `yarn run dev:docker` (Marzal's `#524`, already merged to `master`) adds
-  `--host=0.0.0.0` and is what `web-ui-dev`'s command actually runs.
+- **Loopback vs `0.0.0.0` (two places).** (1) *Host reachability:* plain
+  `docker run -p`/Compose `ports:` publishing forwards into the container's
+  own network namespace; a server bound to `127.0.0.1` *inside* the container
+  is unreachable from the host regardless of how the port is published.
+  `yarn run dev` alone hits this. `yarn run dev:docker` (Marzal's `#524`,
+  already merged to `master`) adds `--host=0.0.0.0` and is what this setup
+  runs. The Express API server (`node server`) already binds all interfaces
+  by default (`app.listen(PORT)` with no host argument), so it needs no
+  equivalent flag. (2) *Cross-container reachability:* `webpack.config.js`
+  proxies `/`, `/api`, `/namespace`, and `/podcast` to a hardcoded
+  `http://localhost:5001`. That `localhost` only resolves to the API server
+  if both run on the same loopback -- i.e. the same container. This is why
+  both processes run in one container here (see the design note above);
+  splitting them across two containers breaks the proxy.
 - **The `.env` file trio.** `yarn run start` (`node server`, via `dotenv`)
   reads `.env` at the repo root; `yarn run dev`/`dev:docker` (via
   `dotenv-webpack` + `webpack.config.js`'s `--env.file`) reads
@@ -148,8 +147,8 @@ that entirely -- it works whether or not the bit survived.
 ## Verification status
 
 This was authored and validated without a working Docker install on the
-authoring machine (Compose YAML validated, Dockerfile reviewed by eye
-against Hadolint's common rules, shell script checked with `bash -n`,
-`healthcheck-dev.js` checked with `node --check`) but **has not been run
+authoring machine (Compose YAML validated, the container command string
+checked with `sh -n`, Dockerfile reviewed by eye against Hadolint's common
+rules, shell script checked with `bash -n`) but **has not been run
 end-to-end against a real Docker Engine**. See `pr-notes.md` for the full
 verification story and what a reviewer should confirm before merging.
